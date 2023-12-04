@@ -11,8 +11,8 @@ from copy import deepcopy
 from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
+import proxsuite
 from numba import njit
-from quadprog import solve_qp
 from scipy import sparse
 
 # %% ../nbs/methods.ipynb 4
@@ -680,6 +680,65 @@ class MinTrace(HReconciler):
 
         return P, W
 
+    def _dense_solve(self, S, n_bottom):
+        a = S.T @ np.linalg.pinv(self.W)
+        G = a @ S
+        C = np.eye(n_bottom)
+        b = np.zeros(n_bottom)
+        l = np.zeros(n_bottom)
+        u = np.full(n_bottom, np.inf)
+
+        def solve(y):
+            solution = proxsuite.proxqp.dense.solve(
+                H=G, g=a @ -y, A=None, b=None, C=C, l=l, u=u, eps_abs=1e-9,
+            )
+            return solution.x
+
+        return solve
+
+    def _sparse_solve(self, S, n_bottom):
+        a = S.T @ sparse.linalg.inv(self.W.tocsc())
+        H = sparse.triu(a @ S).tocsc()
+        C = sparse.eye(n_bottom, format='csc')
+        l = np.zeros(n_bottom)
+        u = np.full(n_bottom, np.inf)
+
+        def solve(y):
+            solution = proxsuite.proxqp.sparse.solve(
+                H=H, g=a @ -y, A=None, b=None, C=C, l=l, u=u, eps_abs=1e-9,
+            )
+            return solution.x
+
+        return solve
+
+    def _solve_nonnegative(self, S, y_hat, idx_bottom):
+        _, n_bottom = S.shape
+        negatives = y_hat < 0
+        if negatives.any():
+            warnings.warn('Replacing negative forecasts with zero.')
+            y_hat = np.copy(y_hat)
+            y_hat[negatives] = 0.
+        # Quadratic progamming formulation
+        # here we are solving the quadratic programming problem
+        # formulated in the origial paper
+        # https://robjhyndman.com/publications/nnmint/
+        if sparse.isspmatrix(self.W):
+            solve_fn = self._sparse_solve(S, n_bottom)
+            bottom_up = BottomUpSparse()
+        else:
+            solve_fn = self._dense_solve(S, n_bottom)
+            bottom_up = BottomUp()
+        # the quadratic programming problem
+        # returns the forecasts of the bottom series
+        bottom_fcts = np.apply_along_axis(solve_fn, axis=0, arr=y_hat)
+        if not np.all(bottom_fcts > -1e-8):
+            raise Exception('nonnegative optimization failed')
+        # remove negative values close to zero
+        bottom_fcts = np.maximum(bottom_fcts, 0)
+        self.y_hat = S @ bottom_fcts # Hack
+        # Overwrite P, W and sampler attributes with BottomUp's
+        self.P, self.W = bottom_up._get_PW_matrices(S=S, idx_bottom=idx_bottom)
+
     def fit(self,
             S,
             y_hat,
@@ -712,44 +771,7 @@ class MinTrace(HReconciler):
                                                idx_bottom=idx_bottom)
 
         if self.nonnegative:
-            _, n_bottom = S.shape
-            W_inv = np.linalg.pinv(self.W)
-            negatives = y_hat < 0
-            if negatives.any():
-                warnings.warn('Replacing negative forecasts with zero.')
-                y_hat = np.copy(y_hat)
-                y_hat[negatives] = 0.
-            # Quadratic progamming formulation
-            # here we are solving the quadratic programming problem
-            # formulated in the origial paper
-            # https://robjhyndman.com/publications/nnmint/
-            # The library quadprog was chosen
-            # based on these benchmarks:
-            # https://scaron.info/blog/quadratic-programming-in-python.html
-            a = S.T @ W_inv
-            G = a @ S
-            C = np.eye(n_bottom)
-            b = np.zeros(n_bottom)
-            # the quadratic programming problem
-            # returns the forecasts of the bottom series
-            if self.num_threads == 1:
-                bottom_fcts = np.apply_along_axis(lambda y_hat: solve_qp(G=G, a=a @ y_hat, C=C, b=b)[0], 
-                                                  axis=0, arr=y_hat)
-            else:
-                futures = []
-                with ThreadPoolExecutor(self.num_threads) as executor:
-                    for j in range(y_hat.shape[1]):
-                        future = executor.submit(solve_qp, G=G, a=a @ y_hat[:, j], C=C, b=b)
-                        futures.append(future)
-                    bottom_fcts = np.hstack([f.result()[0][:, None] for f in futures])
-            if not np.all(bottom_fcts > -1e-8):
-                raise Exception('nonnegative optimization failed')
-            # remove negative values close to zero
-            bottom_fcts = np.clip(np.float32(bottom_fcts), a_min=0, a_max=None)
-            self.y_hat = S @ bottom_fcts # Hack
-
-            # Overwrite P, W and sampler attributes with BottomUp's
-            self.P, self.W = BottomUp()._get_PW_matrices(S=S, idx_bottom=idx_bottom)            
+            self._solve_nonnegative(S, y_hat, idx_bottom)
 
         self.sampler = self._get_sampler(S=S,
                                          P=self.P,
@@ -847,11 +869,6 @@ class MinTraceSparse(MinTrace):
         if self.method not in diag_only_methods:
             raise NotImplementedError(
                 "Only the methods with diagonal W are supported as sparse operations"
-            )
-
-        if self.nonnegative:
-            raise NotImplementedError(
-                "Non-negative MinT is currently not implemented as sparse"
             )
 
         S = sparse.csr_matrix(S)
